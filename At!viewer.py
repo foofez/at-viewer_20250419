@@ -6,8 +6,8 @@ from io import BytesIO
 from bs4 import BeautifulSoup
 from PIL import Image, UnidentifiedImageError
 from PyQt5 import QtGui
-from PyQt5.QtWidgets import QLineEdit, QVBoxLayout, QApplication, QGridLayout, QMessageBox, QScrollArea, QMainWindow, QPushButton, QWidget, QHBoxLayout, QLabel, QSlider, QFileDialog, QStatusBar, QProgressBar
-from PyQt5.QtCore import QPoint, Qt, QUrl, QSize, pyqtSignal, QThread
+from PyQt5.QtWidgets import QLineEdit, QVBoxLayout, QApplication, QGridLayout, QMessageBox, QScrollArea, QMainWindow, QPushButton, QWidget, QHBoxLayout, QLabel, QSlider, QFileDialog, QStatusBar, QComboBox, QProgressBar, QSizePolicy
+from PyQt5.QtCore import QPoint, Qt, QUrl, QSize, pyqtSignal, QThread, QTimer
 from PyQt5.QtGui import QFont, QImage, QPixmap
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
 import concurrent.futures
@@ -39,6 +39,21 @@ class DownloadThread(QThread):
             for episode in range(self.start_episode, self.end_episode + 1):
                 episode_dir = os.path.join(self.save_dir, f"{self.webtoon_title}_{self.webtoon_id}")
                 os.makedirs(episode_dir, exist_ok=True)
+
+                # 썸네일 이미지 다운로드 (첫 회차만)
+                if episode == self.start_episode:
+                    list_url = f"https://comic.naver.com/webtoon/list?titleId={self.webtoon_id}"
+                    try:
+                        res = session.get(list_url, headers=headers)
+                        soup = BeautifulSoup(res.text, 'html.parser')
+                        image_url = soup.find("meta", {"property": "og:image"})["content"]
+                        if image_url:
+                            thumb_data = session.get(image_url, headers=headers).content
+                            thumb_path = os.path.join(episode_dir, "thumbnail.jpg")
+                            with open(thumb_path, "wb") as f:
+                                f.write(thumb_data)
+                    except Exception as e:
+                        print("썸네일 다운로드 실패:", e)
                 if self.is_episode_downloaded(episode_dir, episode):
                     continue
                 url = f"https://comic.naver.com/webtoon/detail?titleId={self.webtoon_id}&no={episode}"
@@ -52,6 +67,7 @@ class DownloadThread(QThread):
                     return
                 if episode is not None:
                     self.downloaded_images += downloaded_images
+                    self.progress_signal.emit(f"{episode}화 다운로드 완료: {downloaded_images}장", None)
                     progress_ratio = self.downloaded_images / self.total_images * 100
                     self.progress_signal.emit(f"Progress: {self.downloaded_images}/{self.total_images}  ({progress_ratio:.1f}%)", int(progress_ratio))
                 if downloaded_images > 0:
@@ -75,6 +91,7 @@ class DownloadThread(QThread):
         if not img_urls:
             return episode, 0
         self.total_images += len(img_urls)
+        self.progress_signal.emit(f"{episode}화 이미지 {len(img_urls)}장 다운로드 시작", None)
         downloaded_images = 0
         for i, img_url in enumerate(img_urls):
             response = session.get(img_url, headers=headers)
@@ -231,6 +248,18 @@ class AlertButton(QWidget):
 
         self.webtoon_list_window = QMainWindow(self)
         self.webtoon_list_window.setWindowTitle("저장된 웹툰 목록")
+
+        # 🔍 검색창 추가
+        search_layout = QHBoxLayout()
+        search_label = QLabel("* 저장된 웹툰 검색:")
+        self.search_input = QLineEdit()
+        self.search_input.textChanged.connect(lambda: self.filter_webtoons(layout, container))
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(self.search_input)
+
+        full_container = QWidget()
+        full_layout = QVBoxLayout(full_container)
+        full_layout.addLayout(search_layout)
         self.webtoon_list_window.resize(1000, 800)
 
         scroll = QScrollArea()
@@ -317,9 +346,46 @@ class AlertButton(QWidget):
 
             btn_layout.addWidget(start_btn)
             btn_layout.addWidget(resume_btn)
+
+            # 회차 선택 콤보박스 추가
+            episode_select = QComboBox()
+            episode_select.addItem("회차 선택")
+
+            episode_numbers = sorted({
+                int(name.split("_")[-2])
+                for name in os.listdir(path)
+                if name.endswith(".jpg") and name.count("_") >= 2 and name.split("_")[-2].isdigit()
+            })
+
+            last_episode = None
+            progress_file = os.path.join(path, "last_read.txt")
+            if os.path.exists(progress_file):
+                try:
+                    with open(progress_file, "r") as f:
+                        last_episode = int(f.read().strip().split(":")[0])
+                except:
+                    pass
+
+            for ep in episode_numbers:
+                text = f"{ep}화"
+                if last_episode == ep:
+                    text += " ⭐"
+                episode_select.addItem(text, ep)
+
+            episode_select.currentIndexChanged.connect(
+                lambda _, p=path, t=title, tid=title_id, box=episode_select:
+                    self.start_webtoon_from(p, t, tid, box.currentData())
+                    if isinstance(box.currentData(), int) else None
+            )
+            btn_layout.addWidget(episode_select)
             btn_layout.addWidget(delete_btn)
 
             card_layout.addWidget(thumb_label)
+
+            # 웹툰 제목 표시 라벨 추가
+            title_label = QLabel(f"<b>{title}</b>")
+            title_label.setAlignment(Qt.AlignCenter)
+            card_layout.addWidget(title_label)
             card_layout.addWidget(desc_label)
             card_layout.addLayout(btn_layout)
             card.setLayout(card_layout)
@@ -327,55 +393,226 @@ class AlertButton(QWidget):
             row = layout.rowCount()
             layout.addWidget(card, row, 0, 1, 1)
 
+            full_layout.addWidget(container)
         container.setLayout(layout)
-        scroll.setWidget(container)
+        scroll.setWidget(full_container)
         self.webtoon_list_window.setCentralWidget(scroll)
         self.webtoon_list_window.show()
 
+    def filter_webtoons(self, layout, container):
+        keyword = self.search_input.text().lower()
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            if item is None:
+                continue
+            widget = item.widget()
+            if not widget:
+                continue
+            label_widgets = widget.findChildren(QLabel)
+            match = False
+            for lbl in label_widgets:
+                if keyword in lbl.text().lower():
+                    match = True
+                    break
+            widget.setVisible(match)
+
     def start_webtoon_from(self, folder, title, title_id, start_episode):
-        # 기존 뷰어 닫기
-        if hasattr(self, 'saved_webtoon_viewer') and self.saved_webtoon_viewer:
-            self.saved_webtoon_viewer.close()
-
-        # 뷰어 초기화
-        self.saved_webtoon_viewer = QMainWindow()
-        self.saved_webtoon_viewer.setWindowTitle(f"{title} - 웹툰 뷰어")
-        self.saved_webtoon_viewer.resize(800, 1000)
-
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_container = QWidget()
-        self.scroll_layout = QVBoxLayout(self.scroll_container)
-        self.scroll_layout.setSpacing(0)
-        self.scroll_area.setWidget(self.scroll_container)
-
-        self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_scroll)
-        self.saved_webtoon_viewer.setCentralWidget(self.scroll_area)
-
         self.viewer_folder = folder
         self.viewer_title = title
         self.viewer_title_id = title_id
         self.viewer_current_episode = start_episode
+        self.viewer_folder = folder
+        self.viewer_title = title
+        self.viewer_title_id = title_id
+        self.viewer_current_episode = start_episode
+        episode_images = glob.glob(os.path.join(folder, f"*_{start_episode}_*.jpg"))
 
-        self.load_viewer_episode(self.viewer_current_episode)
+        if not episode_images:
+            reply = QMessageBox.question(self, "에피소드 없음", f"{start_episode}화를 다운로드하시겠습니까?", QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+
+            self.saved_webtoon_viewer = QMainWindow(self)
+            self.saved_webtoon_viewer.setWindowTitle(f"{title} - {start_episode}화")
+            self.saved_webtoon_viewer.resize(1000, 800)
+
+            self.scroll_layout = QVBoxLayout()
+            self.scroll_layout.setSpacing(0)
+            scroll_widget = QWidget()
+            scroll_widget.setLayout(self.scroll_layout)
+
+            self.scroll_area = QScrollArea()
+            self.scroll_area.setWidgetResizable(True)
+            self.scroll_area.setWidget(scroll_widget)
+            self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_scroll)
+            self.saved_webtoon_viewer.setCentralWidget(self.scroll_area)
+
+            self.viewer_message_label = QLabel("", self.saved_webtoon_viewer)
+            self.viewer_message_label.setAlignment(Qt.AlignCenter)
+            self.viewer_message_label.setStyleSheet("background-color: rgba(0, 0, 0, 200); color: white; font-size: 20px; padding: 20px; border-radius: 10px;")
+            self.viewer_message_label.setFixedSize(400, 100)
+
+            self.viewer_progress_bar = QProgressBar(self.viewer_message_label)
+            self.viewer_progress_bar.setGeometry(20, 70, 360, 10)
+            self.viewer_progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #333;
+                    background-color: #222;
+                    height: 10px;
+                    border-radius: 5px;
+                }
+                QProgressBar::chunk {
+                    background-color: qlineargradient(
+                        spread:pad, x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #4CAF50, stop:1 #8BC34A
+                    );
+                    border-radius: 5px;
+                }
+            """)
+            self.viewer_progress_bar.setRange(0, 100)
+            self.viewer_progress_bar.setValue(0)
+            self.viewer_progress_bar.hide()
+            self.viewer_message_label.hide()
+
+            self.saved_webtoon_viewer.show()
+
+            self.download_thread = DownloadThread(title_id, title, start_episode, start_episode, os.path.dirname(folder))
+            self.download_thread.progress_signal.connect(self.show_centered_message)
+            self.download_thread.finished.connect(lambda: self.after_auto_download(start_episode))
+            self.download_thread.start()
+            return
+
+            self.download_thread = DownloadThread(title_id, title, start_episode, start_episode, os.path.dirname(folder))
+            self.download_thread.progress_signal.connect(self.show_centered_message)
+            self.download_thread.finished.connect(lambda: self.after_auto_download(start_episode))
+            self.download_thread.start()
+            return
+            self.download_thread = DownloadThread(title_id, title, start_episode, start_episode, os.path.dirname(folder))
+            self.download_thread.progress_signal.connect(self.show_centered_message)
+            self.download_thread.finished.connect(lambda: self.after_auto_download(start_episode))
+            self.download_thread.start()
+            return
+    
+        self.viewer_folder = folder
+        self.viewer_title = title
+        self.viewer_title_id = title_id
+        self.viewer_current_episode = start_episode
+    
+        self.saved_webtoon_viewer = QMainWindow(self)
+        self.saved_webtoon_viewer.setWindowTitle(f"{title} - {start_episode}화")
+        self.saved_webtoon_viewer.resize(1000, 800)
+    
+        self.scroll_layout = QVBoxLayout()
+        self.scroll_layout.setSpacing(0)
+        scroll_widget = QWidget()
+        scroll_widget.setLayout(self.scroll_layout)
+    
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(scroll_widget)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_scroll)
+        self.saved_webtoon_viewer.setCentralWidget(self.scroll_area)
+    
+        self.viewer_message_label = QLabel("", self.saved_webtoon_viewer)
+        self.viewer_message_label.setAlignment(Qt.AlignCenter)
+        self.viewer_message_label.setStyleSheet("background-color: rgba(0, 0, 0, 200); color: white; font-size: 20px; padding: 20px; border-radius: 10px;")
+        self.viewer_message_label.setFixedSize(400, 100)
+    
+        self.viewer_progress_bar = QProgressBar(self.viewer_message_label)
+        self.viewer_progress_bar.setGeometry(20, 70, 360, 10)
+        self.viewer_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #333;
+                background-color: #222;
+                height: 10px;
+                border-radius: 5px;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(
+                    spread:pad, x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4CAF50, stop:1 #8BC34A
+                );
+                border-radius: 5px;
+            }
+        """)
+        self.viewer_progress_bar.setRange(0, 100)
+        self.viewer_progress_bar.setValue(0)
+        self.viewer_progress_bar.hide()
+        self.viewer_message_label.hide()
+    
         self.saved_webtoon_viewer.show()
+        self.load_viewer_episode(start_episode)
+
 
     def load_viewer_episode(self, episode):
+        self.saved_webtoon_viewer.setWindowTitle(f"{self.viewer_title} - {episode}화")
+        # 기존 이미지 제거
+        while self.scroll_layout.count():
+            item = self.scroll_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
         image_paths = natsorted(glob.glob(os.path.join(self.viewer_folder, f"*_{episode}_*.jpg")))
         if not image_paths:
             QMessageBox.information(self, "정보", f"{episode}화 이미지를 찾을 수 없습니다.")
             return
 
-        for img_path in image_paths:
+        # 이미지 번호 저장 파일 불러오기
+        img_index = 0
+        progress_file = os.path.join(self.viewer_folder, "last_read.txt")
+        if os.path.exists(progress_file):
+            with open(progress_file, "r") as f:
+                try:
+                    ep, idx = f.read().strip().split(":")
+                    if int(ep) == episode:
+                        img_index = int(idx)
+                except:
+                    img_index = 0
+
+        for i, img_path in enumerate(image_paths):
             img = QImage(img_path)
             if img.isNull():
                 continue
             label = QLabel()
-            label.setPixmap(QPixmap.fromImage(img))
+            pixmap = QPixmap.fromImage(img)
+            label.setPixmap(pixmap)
+            label.setScaledContents(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+            label.setScaledContents(False)
+            label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
             label.setAlignment(Qt.AlignCenter)
             self.scroll_layout.addWidget(label)
 
+            def make_update_func(ep=episode, idx=i):
+                def update_position():
+                    progress_file = os.path.join(self.viewer_folder, "last_read.txt")
+                    try:
+                        with open(progress_file, "w") as f:
+                            f.write(f"{ep}:{idx}")
+                    except:
+                        print("[경고] 위치 저장 실패")
+                return update_position
+
+            label.installEventFilter(self)
+            label.update_position = make_update_func()
+
+            if i == img_index:
+                self.scroll_target_label = label
+
+        QTimer.singleShot(100, self.scroll_to_saved_image)
         self.viewer_current_episode = episode
+        try:
+            with open(progress_file, "w") as f:
+                f.write(f"{episode}:0")
+        except:
+            print("[경고] 이어보기 저장 실패")
+        # 이어보기 저장: 현재 회차, 이미지 인덱스 0으로 초기화
+        try:
+            with open(progress_file, "w") as f:
+                f.write(f"{episode}:0")
+        except:
+            print("[경고] 이어보기 저장 실패")
         # 이어보기 저장
         progress_file = os.path.join(self.viewer_folder, "last_read.txt")
         try:
@@ -385,36 +622,31 @@ class AlertButton(QWidget):
             print("[경고] 이어보기 저장 실패")
 
     def on_scroll(self):
-        if hasattr(self, 'download_thread') and self.download_thread.isRunning():
-            return  # 중복 다운로드 방지
         scroll_bar = self.scroll_area.verticalScrollBar()
         max_scroll = scroll_bar.maximum()
         current_scroll = scroll_bar.value()
 
         if current_scroll == max_scroll:
             next_ep = self.viewer_current_episode + 1
+            if getattr(self, '_scrolling_lock', False):
+                return
+            self._scrolling_lock = True
             episode_images = glob.glob(os.path.join(self.viewer_folder, f"*_{next_ep}_*.jpg"))
             if episode_images:
+                for i in reversed(range(self.scroll_layout.count())):
+                    widget = self.scroll_layout.itemAt(i).widget()
+                    if widget:
+                        widget.deleteLater()
                 self.load_viewer_episode(next_ep)
+                QTimer.singleShot(500, lambda: setattr(self, '_scrolling_lock', False))
             else:
-                # 자동 다운로드 시도
-                download_dir = self.viewer_folder
-                webtoon_id = self.viewer_title_id
-                webtoon_title = self.viewer_title
-
-                download_thread = DownloadThread(webtoon_id, webtoon_title, next_ep, next_ep, download_dir)
-                self.download_thread = DownloadThread(webtoon_id, webtoon_title, next_ep, next_ep, download_dir)
-                self.download_thread.progress_signal.connect(self.status_bar.showMessage)
+                self.download_thread = DownloadThread(self.viewer_title_id, self.viewer_title, next_ep, next_ep, os.path.dirname(self.viewer_folder))
+                self.download_thread.progress_signal.connect(self.show_centered_message)
                 self.download_thread.finished.connect(lambda: self.after_auto_download(next_ep))
+                self.download_thread.error = False
                 self.download_thread.start()
-                return  # 다운로드 완료 후 후처리에서 다음 회차 로드 시도
-
-                # 다시 확인 후 로드 또는 메시지
-                episode_images = glob.glob(os.path.join(self.viewer_folder, f"*_{next_ep}_*.jpg"))
-                if episode_images:
-                    self.load_viewer_episode(next_ep)
-                else:
-                    pass  # 이후 다운로드 실패 시 처리
+                # 🔧 다운로드 완료 후 스크롤 잠금 해제
+                self.download_thread.finished.connect(lambda: QTimer.singleShot(500, lambda: setattr(self, '_scrolling_lock', False)))
 
         elif current_scroll == 0:
             prev_ep = self.viewer_current_episode - 1
@@ -423,38 +655,62 @@ class AlertButton(QWidget):
                 return
             episode_images = glob.glob(os.path.join(self.viewer_folder, f"*_{prev_ep}_*.jpg"))
             if episode_images:
-                for img_path in reversed(natsorted(episode_images)):
-                    img = QImage(img_path)
-                    if img.isNull():
-                        continue
-                    label = QLabel()
-                    label.setPixmap(QPixmap.fromImage(img))
-                    label.setAlignment(Qt.AlignCenter)
-                    self.scroll_layout.insertWidget(0, label)
-                self.viewer_current_episode = prev_ep
+                for i in reversed(range(self.scroll_layout.count())):
+                    widget = self.scroll_layout.itemAt(i).widget()
+                    if widget:
+                        widget.deleteLater()
+                self.load_viewer_episode(prev_ep)
                 scroll_bar.setValue(scroll_bar.minimum() + 1)
             else:
-                QMessageBox.information(self, "정보", "이전 에피소드가 없습니다.")
-                return
-            episode_images = glob.glob(os.path.join(self.viewer_folder, f"*_{prev_ep}_*.jpg"))
-            if episode_images:
-                for img_path in reversed(natsorted(episode_images)):
-                    img = QImage(img_path)
-                    if img.isNull():
-                        continue
-                    label = QLabel()
-                    label.setPixmap(QPixmap.fromImage(img))
-                    label.setAlignment(Qt.AlignCenter)
-                    self.scroll_layout.insertWidget(0, label)
-                self.viewer_current_episode = prev_ep
-                scroll_bar.setValue(scroll_bar.minimum() + 1)
-            else:
-                QMessageBox.information(self, "정보", "이전 에피소드가 없습니다.")
+                self.download_thread = DownloadThread(self.viewer_title_id, self.viewer_title, prev_ep, prev_ep, os.path.dirname(self.viewer_folder))
+                self.download_thread.progress_signal.connect(self.show_centered_message)
+                self.download_thread.finished.connect(lambda: self.after_auto_download(prev_ep))
+                self.download_thread.start()
+                QTimer.singleShot(100, lambda: scroll_bar.setValue(scroll_bar.minimum()))
+
+    def eventFilter(self, obj, event):
+        if event.type() == event.Enter and hasattr(obj, 'update_position'):
+            obj.update_position()
+        return super().eventFilter(obj, event)
+
+    def scroll_to_saved_image(self):
+        if hasattr(self, 'scroll_target_label'):
+            bar = self.scroll_area.verticalScrollBar()
+            bar.setValue(self.scroll_target_label.y())
+
+    def show_centered_message(self, message, progress):
+        if hasattr(self, 'viewer_message_label'):
+            self.viewer_message_label.setText(message)
+            self.viewer_message_label.adjustSize()
+            window_width = self.saved_webtoon_viewer.width()
+            window_height = self.saved_webtoon_viewer.height()
+            label_width = self.viewer_message_label.width()
+            label_height = self.viewer_message_label.height()
+            x = (window_width - label_width) // 2
+            y = (window_height - label_height) // 2
+            self.viewer_message_label.move(x, y)
+            self.viewer_message_label.show()
+
+            if hasattr(self, 'viewer_progress_bar'):
+                self.viewer_progress_bar.show()
+                if progress is not None:
+                    self.viewer_progress_bar.setValue(progress)
+                else:
+                    self.viewer_progress_bar.setValue(0)
+
+                # ✅ 퍼센트 숫자 제거
+                self.viewer_progress_bar.setTextVisible(False)
 
     def after_auto_download(self, episode):
+        if getattr(self.download_thread, 'error', False):
+            self.viewer_message_label.hide()
+            QMessageBox.information(self, "정보", "다음 회차가 없습니다.")
+            return
         episode_images = glob.glob(os.path.join(self.viewer_folder, f"*_{episode}_*.jpg"))
         if episode_images:
             self.load_viewer_episode(episode)
+            if hasattr(self, 'viewer_message_label'):
+                self.viewer_message_label.hide()
         else:
             QMessageBox.information(self, "정보", "다음 회차가 없습니다.")
 
